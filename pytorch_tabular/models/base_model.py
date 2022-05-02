@@ -13,9 +13,9 @@ import torchmetrics
 from omegaconf import DictConfig
 from torch import Tensor
 
-import pytorch_tabular.models.ssl.augmentations as augmentations
+# import pytorch_tabular.models.ssl.augmentations as augmentations
 # import pytorch_tabular.models.ssl.ssl_utils as ssl_utils
-import pytorch_tabular.models.ssl.ssl_losses as ssl_losses
+# import pytorch_tabular.models.ssl.ssl_losses as ssl_losses
 
 # from pytorch_tabular.utils import loss_contrastive
 
@@ -58,8 +58,10 @@ class BaseModel(pl.LightningModule, metaclass=ABCMeta):
         if len(self.custom_optimizer_params) > 0:
             config.optimizer_params = self.custom_optimizer_params
         self.save_hyperparameters(config)
-        # The concatenated output dim of the embedding layer
+        
         self._build_network()
+        if hasattr(self, "backbone"):
+            assert hasattr(self.backbone, "output_dim"), "Any backbone must have an output_dim attribute"
         self._setup_loss()
         self._setup_metrics()
 

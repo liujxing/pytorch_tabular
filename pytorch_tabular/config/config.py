@@ -7,7 +7,10 @@ import os
 from dataclasses import MISSING, dataclass, field
 from typing import Any, Dict, List, Optional
 
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
+
+# from pytorch_tabular.models.category_embedding.config import CategoryEmbeddingModelConfig
+
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,10 @@ class DataConfig:
         metadata={
             "help": "(Column names, Freq) tuples of the date fields. For eg. a field named introduction_date and with a monthly frequency should have an entry ('intro_date','M'}"
         },
+    )
+    handle_unseen_categories: str = field(
+        default="impute",
+        metadata={"help": "Specifies how to handle unknown and missing categorical values. `impute` creates an additional category for missing and unseen categorical values and learns an embedding. `error` throws an error. For SSL task, unknown categorical values are not supported and will be hardcoded to `error` Choices are: impute, error"},
     )
 
     encode_date_columns: bool = field(
@@ -576,7 +583,7 @@ class ExperimentRunManager:
 class ModelConfig:
     """Base Model configuration
     Args:
-        task (str): Specify whether the problem is regression, classification. Choices are: regression classification
+        task (str): Specify whether the problem is regression, classification or using as an encoder\decoder in SSL. Choices are: regression classification encoder_decoder
 
         embedding_dims (Optional[List[int], NoneType]): The dimensions of the embedding for each categorical column
             as a list of tuples (cardinality, embedding_dim). If left empty, will infer using the cardinality of the categorical column
@@ -604,8 +611,8 @@ class ModelConfig:
     task: str = field(
         # default="regression",
         metadata={
-            "help": "Specify whether the problem is regression of classification.",
-            "choices": ["regression", "classification"],
+            "help": "Specify whether the problem is regression, classification or using as an encoder/decoder in SSL.",
+            "choices": ["regression", "classification", "encoder_decoder"],
         }
     )
     embedding_dims: Optional[List] = field(
@@ -671,15 +678,26 @@ class ModelConfig:
                 if self.metrics_params is None
                 else self.metrics_params
             )
+        elif self.task == "encoder_decoder":
+            pass
         else:
             raise NotImplementedError(
                 f"{self.task} is not a valid task. Should be one of "
                 f"{self.__dataclass_fields__['task'].metadata['choices']}"
             )
-        assert len(self.metrics) == len(
-            self.metrics_params
-        ), "metrics and metric_params should have same length"
+        if self.metrics is not None:
+            assert len(self.metrics) == len(
+                self.metrics_params
+            ), "metrics and metric_params should have same length"
         _validate_choices(self)
+
+
+@dataclass
+class IdentityBackboneConfig(ModelConfig):
+    _module_src: str = field(default="torch.nn")
+    _model_name: str = field(default="Identity")
+    _backbone_name: str = field(default="Identity")
+    _config_name: str = field(default="IdentityBackboneConfig")
 
 
 @dataclass
@@ -709,6 +727,15 @@ class SSLModelConfig:
     """
 
     task: str = field(init=False, default="ssl")
+    # TODO encoder_config as tuple of module name, class name, params?
+    encoder_config: object = field(
+        metadata={"help": "The configuration for the encoder model"},
+    )
+
+    decoder_config: object = field(
+        default=IdentityBackboneConfig(task="encoder_decoder"),
+        metadata={"help": "The configuration for the decoder model"},
+    )
 
     embedding_dims: Optional[List] = field(
         default=None,
@@ -721,48 +748,18 @@ class SSLModelConfig:
     learning_rate: float = field(
         default=1e-3, metadata={"help": "The learning rate of the model"}
     )
-    loss: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "The loss function to be applied. Not relevant if ssl_task is contrastive"
-        },
-    )
-    metrics: Optional[List[str]] = field(
-        default=None,
-        metadata={
-            "help": "The list of metrics you need to track during training. The metrics should be one "
-            "of the functional metrics implemented in ``torchmetrics``. By default, "
-            "it is mean_squared_error for ssl"
-        },
-    )
-    metrics_params: Optional[List] = field(
-        default=None,
-        metadata={"help": "The parameters to be passed to the metrics function"},
-    )
     seed: int = field(
         default=42,
         metadata={"help": "The seed for reproducibility. Defaults to 42"},
     )
 
     def __post_init__(self):
-        assert self.ssl_task, "if task is ssl, ssl_task cannot be None"
-        assert self.aug_task, "if task is ssl, aug_task cannot be None"
-        if self.ssl_task == "Contrastive":
-            if self.loss:
-                logger.warning(
-                    "In case of Contrastive the loss cannot be specified and will be ignored"
-                )
-            self.loss = "ContrastiveLoss" if self.loss is None else self.loss
-        else:
-            self.loss = "MSELoss" if self.loss is None else self.loss
-        if self.metrics is None:
-            self.metrics = (
-                ["mean_squared_error"] if self.metrics is None else self.metrics
-            )
-            self.metrics_params = [{}]
-        assert len(self.metrics) == len(
-            self.metrics_params
-        ), "metrics and metric_params should have same length"
+        assert hasattr(
+            self.encoder_config, "_backbone_name"
+        ), "Only `ModelConfig`s which have the attribute `_backbone_name` are supported as encoder"
+        assert hasattr(
+            self.decoder_config, "_backbone_name"
+        ), "Only `ModelConfig`s which have the attribute `_backbone_name` are supported as decoder"
         _validate_choices(self)
 
 

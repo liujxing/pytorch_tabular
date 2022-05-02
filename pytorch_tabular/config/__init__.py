@@ -2,6 +2,8 @@ from .config import (
     TrainerConfig,
     DataConfig,
     ModelConfig,
+    IdentityBackboneConfig,
+    SSLModelConfig,
     ExperimentConfig,
     OptimizerConfig,
     ExperimentRunManager,
@@ -15,5 +17,7 @@ __all__ = [
     "ExperimentConfig",
     "OptimizerConfig",
     "ExperimentRunManager",
+    "IdentityBackboneConfig",
+    "SSLModelConfig",
     "_validate_choices",
 ]

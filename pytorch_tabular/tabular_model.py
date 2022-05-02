@@ -8,6 +8,7 @@ import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
+import warnings
 
 import joblib
 import numpy as np
@@ -28,6 +29,7 @@ from torch import nn
 from tqdm.autonotebook import tqdm
 
 import pytorch_tabular.models as models
+import pytorch_tabular.ssl_models as ssl_models
 from pytorch_tabular.config import (
     DataConfig,
     ExperimentConfig,
@@ -131,9 +133,14 @@ class TabularModel:
 
         self.exp_manager = ExperimentRunManager()
         if model_callable is None:
-            self.model_callable = getattr(
-                getattr(models, self.config._module_src), self.config._model_name
-            )
+            if self.config.task=="ssl":
+                self.model_callable = getattr(
+                    getattr(ssl_models, self.config._module_src), self.config._model_name
+                )
+            else:
+                self.model_callable = getattr(
+                    getattr(models, self.config._module_src), self.config._model_name
+                )
             self.custom_model = False
         else:
             self.model_callable = model_callable
@@ -440,8 +447,9 @@ class TabularModel:
             seed (Optional[int], optional): Random seed for reproducibility. Defaults to 42.
         """
         logger.info("Preparing the DataLoaders...")
-        target_transform = self._check_and_set_target_transform(target_transform)
-
+        # For SSL, we need not do target transforms
+        if self.config.task != "ssl":
+            target_transform = self._check_and_set_target_transform(target_transform)
         datamodule = TabularDatamodule(
             train=train,
             validation=validation,
@@ -590,7 +598,7 @@ class TabularModel:
 
             target_transform (Optional[Union[TransformerMixin, Tuple(Callable)]], optional): If provided, applies the transform to the target before modelling
                 and inverse the transform during prediction. The parameter can either be a sklearn Transformer which has an inverse_transform method, or
-                a tuple of callables (transform_func, inverse_transform_func)
+                a tuple of callables (transform_func, inverse_transform_func). Ignored for SSL tasks. Defaults to None.
 
             max_epochs (Optional[int]): Overwrite maximum number of epochs to be run. Defaults to None.
 
@@ -957,3 +965,326 @@ class TabularModel:
 
     def __str__(self) -> str:
         return self.summary()
+
+
+class SSLTabularModel(TabularModel):
+    def __init__(
+        self,
+        config: Optional[DictConfig] = None,
+        data_config: Optional[Union[DataConfig, str]] = None,
+        model_config: Optional[Union[ModelConfig, str]] = None,
+        optimizer_config: Optional[Union[OptimizerConfig, str]] = None,
+        trainer_config: Optional[Union[TrainerConfig, str]] = None,
+        experiment_config: Optional[Union[ExperimentConfig, str]] = None,
+        model_callable: Optional[Callable] = None,
+        encoder: Optional[torch.nn.Module] = None,
+        decoder: Optional[torch.nn.Module] = None,
+    ) -> None:
+        """The core model which orchestrates everything from initializing the datamodule, the model, trainer, etc.
+
+        Args:
+            config (Optional[Union[DictConfig, str]], optional): Single OmegaConf DictConfig object or
+                the path to the yaml file holding all the config parameters. Defaults to None.
+
+            data_config (Optional[Union[DataConfig, str]], optional): DataConfig object or path to the yaml file. Defaults to None.
+
+            model_config (Optional[Union[ModelConfig, str]], optional): A subclass of ModelConfig or path to the yaml file.
+                Determines which model to run from the type of config. Defaults to None.
+
+            optimizer_config (Optional[Union[OptimizerConfig, str]], optional): OptimizerConfig object or path to the yaml file.
+                Defaults to None.
+
+            trainer_config (Optional[Union[TrainerConfig, str]], optional): TrainerConfig object or path to the yaml file.
+                Defaults to None.
+
+            experiment_config (Optional[Union[ExperimentConfig, str]], optional): ExperimentConfig object or path to the yaml file.
+                If Provided configures the experiment tracking. Defaults to None.
+
+            model_callable (Optional[Callable], optional): If provided, will override the model callable that will be loaded from the config.
+                Typically used when providing Custom Models
+
+            encoder (Optional[torch.nn.module], optional): If provided, will override the encoder that will be loaded from the config.
+
+            decoder (Optional[torch.nn.module], optional): If provided, will override the decoder that will be loaded from the config.
+        """
+        _config = config if config is not None else model_config
+        self.is_decoder_identity = _config.decoder_config._backbone_name == "Identity"
+        if encoder is None:
+            self.encoder_callable = getattr(
+                getattr(models, _config.encoder_config._module_src),
+                _config.encoder_config._backbone_name,
+            )
+            self.encoder = None
+            self.custom_encoder = False
+        else:
+            self.encoder = encoder
+            self.custom_encoder = True
+        if decoder is None:
+            if self.is_decoder_identity:
+                self.decoder_callable = nn.Identity
+            else:
+                self.decoder_callable = getattr(
+                    getattr(models, _config.decoder_config._module_src),
+                    _config.decoder_config._backbone_name,
+                )
+            self.decoder = None
+            self.custom_decoder = False
+        else:
+            self.decoder = decoder
+            self.custom_decoder = True
+        super().__init__(
+            config,
+            data_config,
+            model_config,
+            optimizer_config,
+            trainer_config,
+            experiment_config,
+            model_callable,
+            None,
+        )
+
+    def _run_validation(self):
+        """Validates the Config params and throws errors if something is wrong
+
+        Raises:
+            NotImplementedError: If you provide a multi-target config to a classification task
+            ValueError: If there is a problem with Target Range
+        """
+        if self.config.task != "ssl":
+            raise NotImplementedError(
+                "Only a `SSLModelConfig` can be used with `SSLTabularModel`."
+            )
+        if self.config.handle_unseen_categories == "impute":
+            warnings.warn("`handle_unseen_categories` is set to `impute` for SSL task. Reverting to `error`")
+            self.config.handle_unseen_categories = "error"
+
+    def prepare_model(
+        self,
+        datamodule: TabularDatamodule,
+        updated_config: DictConfig,
+        loss: Optional[torch.nn.Module] = None,
+        metrics: Optional[List[Callable]] = None,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        optimizer_params: Dict = {},
+    ):
+        """Prepares the model for training.
+
+        Args:
+            datamodule (TabularDatamodule): The datamodule
+
+            updated_config (DictConfig): The config which has been updated from data
+
+            loss (Optional[torch.nn.Module], optional): Custom Loss functions which are not in standard pytorch library
+
+            metrics (Optional[List[Callable]], optional): Custom metric functions(Callable) which has the
+                signature metric_fn(y_hat, y) and works on torch tensor inputs
+
+            optimizer (Optional[torch.optim.Optimizer], optional): Custom optimizers which are a drop in replacements for standard PyToch optimizers.
+                This should be the Class and not the initialized object
+
+            optimizer_params (Optional[Dict], optional): The parmeters to initialize the custom optimizer.
+
+        """
+        logger.info(f"Preparing the SSL Model: {self.config._model_name}...")
+        assert (
+            hasattr(updated_config, "_updated") and updated_config._updated
+        ), "config has not been updated with data. Please call prepare_datamodule() first"
+        # Fetching the config as some data specific configs have been added in the datamodule
+        self.config = updated_config
+        # if hasattr(self, "model") and self.model is not None and not reset:
+        #     logger.debug("Using the trained model...")
+        # else:
+        # logger.debug("Re-initializing the model. Trained weights are ignored.")
+        if self.encoder is None:
+            self.config.encoder_config.continuous_cols = self.config.continuous_cols
+            self.config.encoder_config.categorical_cols = self.config.categorical_cols
+            self.config.encoder_config.date_columns = self.config.date_columns
+            self.config.encoder_config.continuous_dim = self.config.continuous_dim
+            self.config.encoder_config.categorical_dim = self.config.categorical_dim
+            self.config.encoder_config.handle_unseen_categories = self.config.handle_unseen_categories
+            self.config.encoder_config = datamodule.update_config(self.config.encoder_config)
+            self.encoder = self.encoder_callable(self.config.encoder_config)
+        if self.decoder is None:
+            if self.is_decoder_identity:
+                self.decoder = self.decoder_callable()
+            else:
+                self.config.decoder_config.continuous_cols = [f"encoder_ft_{i}" for i in range(len(self.encoder.output_dim))]
+                self.config.decoder_config.categorical_cols = []
+                self.config.decoder_config.date_columns = []
+                self.config.decoder_config.continuous_dim = self.encoder.output_dim
+                self.config.decoder_config.categorical_dim = 0
+                self.config.decoder_config.handle_unseen_categories = "error"
+                self.config.decoder_config = datamodule.update_config(self.config.decoder_config)
+                self.decoder = self.decoder_callable(self.config.decoder_config)
+        model = self.model_callable(
+            self.encoder,
+            self.decoder,
+            self.config,
+            custom_loss=loss,
+            custom_metrics=metrics,
+            custom_optimizer=optimizer,
+            custom_optimizer_params=optimizer_params,
+        )
+        # Data Aware Initialization(for the models that need it)
+        model.data_aware_initialization(
+            datamodule
+        )  # initializations based on target will not work in SSL mode
+        if self.model_state_dict_path is not None:
+            self._load_weights(model, self.model_state_dict_path)
+            # if trained_backbone:
+            #     model.backbone = trained_backbone
+        if self.track_experiment and self.config.log_target == "wandb":
+            self.logger.watch(
+                model, log=self.config.exp_watch, log_freq=self.config.exp_log_freq
+            )
+        return model
+
+    def save_model(self, dir: str):
+        """Saves the model and checkpoints in the specified directory
+
+        Args:
+            dir (str): The path to the directory to save the model
+        """
+        # if os.path.exists(dir) and (os.listdir(dir)):
+        #     logger.warning("Directory is not empty. Overwriting the contents.")
+        #     for f in os.listdir(dir):
+        #         os.remove(os.path.join(dir, f))
+        # os.makedirs(dir, exist_ok=True)
+        # with open(os.path.join(dir, "config.yml"), "w") as fp:
+        #     OmegaConf.save(self.config, fp, resolve=True)
+        # joblib.dump(self.datamodule, os.path.join(dir, "datamodule.sav"))
+        # if hasattr(self.config, "log_target") and self.config.log_target is not None:
+        #     joblib.dump(self.logger, os.path.join(dir, "exp_logger.sav"))
+        # if hasattr(self, "callbacks"):
+        #     joblib.dump(self.callbacks, os.path.join(dir, "callbacks.sav"))
+        # self.trainer.save_checkpoint(os.path.join(dir, "model.ckpt"))
+        # custom_params = {}
+        # custom_params["custom_loss"] = self.model.custom_loss
+        # custom_params["custom_metrics"] = self.model.custom_metrics
+        # custom_params["custom_optimizer"] = self.model.custom_optimizer
+        # custom_params["custom_optimizer_params"] = self.model.custom_optimizer_params
+        # joblib.dump(custom_params, os.path.join(dir, "custom_params.sav"))
+        # if self.custom_model:
+        #     joblib.dump(
+        #         self.model_callable, os.path.join(dir, "custom_model_callable.sav")
+        #     )
+        super().save_model(dir)
+        if self.custom_encoder:
+            joblib.dump(self.encoder, os.path.join(dir, "encoder.sav"))
+        if self.custom_decoder:
+            joblib.dump(self.decoder, os.path.join(dir, "decoder.sav"))
+
+    @classmethod
+    def load_from_checkpoint(cls, dir: str, map_location=None, strict=True):
+        """Loads a saved model from the directory
+
+        Args:
+            dir (str): The directory where the model wa saved, along with the checkpoints
+            map_location (Union[Dict[str, str], str, device, int, Callable, None]) – If your checkpoint
+                saved a GPU model and you now load on CPUs or a different number of GPUs, use this to map
+                to the new setup. The behaviour is the same as in torch.load()
+            strict (bool) – Whether to strictly enforce that the keys in checkpoint_path match the keys
+                returned by this module’s state dict. Default: True.
+
+        Returns:
+            TabularModel: The saved TabularModel
+        """
+        config = OmegaConf.load(os.path.join(dir, "config.yml"))
+        datamodule = joblib.load(os.path.join(dir, "datamodule.sav"))
+        if (
+            hasattr(config, "log_target")
+            and (config.log_target is not None)
+            and os.path.exists(os.path.join(dir, "exp_logger.sav"))
+        ):
+            logger = joblib.load(os.path.join(dir, "exp_logger.sav"))
+        else:
+            logger = None
+        if os.path.exists(os.path.join(dir, "callbacks.sav")):
+            callbacks = joblib.load(os.path.join(dir, "callbacks.sav"))
+            # Excluding Gradient Accumulation Scheduler Callback as we are creating
+            # a new one in trainer
+            callbacks = [
+                c for c in callbacks if not isinstance(c, GradientAccumulationScheduler)
+            ]
+        else:
+            callbacks = []
+        if os.path.exists(os.path.join(dir, "custom_model_callable.sav")):
+            model_callable = joblib.load(os.path.join(dir, "custom_model_callable.sav"))
+            custom_model = True
+        else:
+            model_callable = getattr(
+                getattr(models, config._module_src), config._model_name
+            )
+            custom_model = False
+        if os.path.exists(os.path.join(dir, "encoder.sav")):
+            encoder = joblib.load(os.path.join(dir, "encoder.sav"))
+            custom_encoder = True
+        else:
+            encoder_callable = getattr(
+                getattr(models, config.encoder_config._module_src),
+                config.encoder_config._backbone_name,
+            )
+            encoder = encoder_callable(config.encoder_config)
+            custom_encoder = False
+        if os.path.exists(os.path.join(dir, "decoder.sav")):
+            decoder = joblib.load(os.path.join(dir, "decoder.sav"))
+            custom_decoder = True
+        else:
+            decoder_callable = getattr(
+                getattr(models, config.decoder_config._module_src),
+                config.decoder_config._backbone_name,
+            )
+            decoder = decoder_callable(config.decoder_config)
+            custom_decoder = False
+
+        custom_params = joblib.load(os.path.join(dir, "custom_params.sav"))
+        model_args = {"encoder": encoder, "decoder": decoder}
+        if custom_params.get("custom_loss") is not None:
+            model_args["loss"] = "MSELoss"  # For compatibility. Not Used
+        if custom_params.get("custom_metrics") is not None:
+            model_args["metrics"] = [
+                "mean_squared_error"
+            ]  # For compatibility. Not Used
+            model_args["metric_params"] = [{}]  # For compatibility. Not Used
+        if custom_params.get("custom_optimizer") is not None:
+            model_args["optimizer"] = "Adam"  # For compatibility. Not Used
+        if custom_params.get("custom_optimizer_params") is not None:
+            model_args["optimizer_params"] = {}  # For compatibility. Not Used
+
+        # Initializing with default metrics, losses, and optimizers. Will revert once initialized
+        model = model_callable.load_from_checkpoint(
+            checkpoint_path=os.path.join(dir, "model.ckpt"),
+            map_location=map_location,
+            strict=strict,
+            **model_args,
+        )
+        # Updating config with custom parameters for experiment tracking
+        if custom_params.get("custom_loss") is not None:
+            model.custom_loss = custom_params["custom_loss"]
+        if custom_params.get("custom_metrics") is not None:
+            model.custom_metrics = custom_params["custom_metrics"]
+        if custom_params.get("custom_optimizer") is not None:
+            model.custom_optimizer = custom_params["custom_optimizer"]
+        if custom_params.get("custom_optimizer_params") is not None:
+            model.custom_optimizer_params = custom_params["custom_optimizer_params"]
+        model._setup_loss()
+        model._setup_metrics()
+        tabular_model = cls(
+            config=config,
+            model_callable=model_callable,
+            encoder=encoder,
+            decoder=decoder,
+        )
+        tabular_model.model = model
+        tabular_model.custom_model = custom_model
+        tabular_model.custom_decoder = custom_decoder
+        tabular_model.custom_encoder = custom_encoder
+        tabular_model.datamodule = datamodule
+        tabular_model.callbacks = callbacks
+        tabular_model.trainer = tabular_model._prepare_trainer(callbacks=callbacks)
+        tabular_model.trainer.model = model
+        tabular_model.logger = logger
+        return tabular_model
+
+    def get_pretrained_encoder(self):
+        return self.encoder

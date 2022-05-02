@@ -23,7 +23,6 @@ from sklearn.preprocessing import (
     StandardScaler,
 )
 from torch.utils.data import DataLoader, Dataset
-
 from .categorical_encoders import OrdinalEncoder
 
 logger = logging.getLogger(__name__)
@@ -64,16 +63,28 @@ class TabularDatamodule(pl.LightningDataModule):
 
         Args:
             train (pd.DataFrame): The Training Dataframe
+
             config (DictConfig): Merged configuration object from ModelConfig, DataConfig,
-            TrainerConfig, OptimizerConfig & ExperimentConfig
+                TrainerConfig, OptimizerConfig & ExperimentConfig
+
             validation (pd.DataFrame, optional): Validation Dataframe.
-            If left empty, we use the validation split from DataConfig to split a random sample as validation.
-            Defaults to None.
+                If left empty, we use the validation split from DataConfig to split a random
+                sample as validation. Defaults to None.
+
             test (pd.DataFrame, optional): Holdout DataFrame to check final performance on.
             Defaults to None.
-            target_transform (Optional[Union[TransformerMixin, Tuple(Callable)]], optional): If provided, applies the transform to the target before modelling
-            and inverse the transform during prediction. The parameter can either be a sklearn Transformer which has an inverse_transform method, or
-            a tuple of callables (transform_func, inverse_transform_func)
+
+            target_transform (Optional[Union[TransformerMixin, Tuple(Callable)]], optional): If
+                provided, applies the transform to the target before modelling and inverse the
+                transform during prediction. The parameter can either be a sklearn
+                Transformer which has an inverse_transform method, or a tuple of callables
+                (transform_func, inverse_transform_func). Defaults to None.
+
+            train_sampler (Optional[torch.utils.data.Sampler], optional): If provided, uses
+                this sampler to shuffle the training data. Defaults to None.
+
+            seed (Optional[int], optional): Random seed for reproducibility. Defaults to 42.
+
         """
         super().__init__()
         self.train = train.copy()
@@ -95,33 +106,29 @@ class TabularDatamodule(pl.LightningDataModule):
         self.seed = seed
         self._fitted = False
 
-    def update_config(self) -> None:
+    def update_config(self, config) -> None:
         """Calculates and updates a few key information to the config object
 
         Raises:
             NotImplementedError: [description]
         """
-        if self.config.task == "regression":
-            self.config.output_dim = len(self.config.target)
-        elif self.config.task == "classification":
-            self.config.output_dim = len(self.train[self.config.target[0]].unique())
-        elif self.config.task == "ssl":
-            self.config.output_dim = len(self.config.categorical_cols) + len(
-                self.config.continuous_cols
-            )
+        if config.task == "regression":
+            config.output_dim = len(config.target)
+        elif config.task == "classification":
+            config.output_dim = len(self.train[config.target[0]].unique())
+        elif config.task == "ssl" or config.task == "encoder_decoder":
+            config.output_dim = np.nan
         if not self.do_leave_one_out_encoder():
-            self.config.categorical_cardinality = [
-                int(self.train[col].fillna("NA").nunique()) + 1
-                for col in self.config.categorical_cols
+            config.categorical_cardinality = [
+                int(self.train[col].dropna().nunique()) + 1 if config.handle_unseen_categories == "impute" else int(self.train[col].dropna().nunique())
+                for col in config.categorical_cols
             ]
-            if (
-                hasattr(self.config, "embedding_dims")
-                and self.config.embedding_dims is None
-            ):
-                self.config.embedding_dims = [
+            if hasattr(config, "embedding_dims") and config.embedding_dims is None:
+                config.embedding_dims = [
                     (x, min(50, (x + 1) // 2))
-                    for x in self.config.categorical_cardinality
+                    for x in config.categorical_cardinality
                 ]
+        return config
 
     def do_leave_one_out_encoder(self) -> bool:
         """Checks the special condition for NODE where we use a LeaveOneOutEncoder to encode categorical columns
@@ -146,6 +153,10 @@ class TabularDatamodule(pl.LightningDataModule):
             tuple[pd.DataFrame, list]: Returns the processed dataframe and the added features(list) as a tuple
         """
         logger.info(f"Preprocessing data: Stage: {stage}...")
+        if self.config.task == "ssl":
+            # making target zero if task is ssl
+            for t in self.config.target:
+                data[t] = 0
         added_features = None
         if self.config.encode_date_columns:
             for field_name, freq in self.config.date_columns:
@@ -185,7 +196,10 @@ class TabularDatamodule(pl.LightningDataModule):
                 else:
                     logger.debug("Encoding Categorical Columns using OrdinalEncoder")
                     self.categorical_encoder = OrdinalEncoder(
-                        cols=self.config.categorical_cols
+                        cols=self.config.categorical_cols,
+                        handle_unseen=self.config.handle_unseen_categories
+                        if self.config.task != "ssl"
+                        else "error",
                     )
                     data = self.categorical_encoder.fit_transform(data)
             else:
@@ -199,8 +213,8 @@ class TabularDatamodule(pl.LightningDataModule):
                 transform = self.CONTINUOUS_TRANSFORMS[
                     self.config.continuous_feature_transform
                 ]
-                if "random_state" in transform['params'] and self.seed is not None:
-                    transform['params']['random_state'] = self.seed
+                if "random_state" in transform["params"] and self.seed is not None:
+                    transform["params"]["random_state"] = self.seed
                 self.continuous_transform = transform["callable"](**transform["params"])
                 # TODO implement quantile noise
                 data.loc[
@@ -242,26 +256,27 @@ class TabularDatamodule(pl.LightningDataModule):
                         data[self.config.target[0]]
                     )
         # Target Transforms
-        if all([col in data.columns for col in self.config.target]):
-            if self.do_target_transform:
-                if stage == "fit":
-                    target_transforms = []
-                    for col in self.config.target:
-                        _target_transform = copy.deepcopy(
-                            self.target_transform_template
-                        )
-                        data[col] = _target_transform.fit_transform(
-                            data[col].values.reshape(-1, 1)
-                        )
-                        target_transforms.append(_target_transform)
-                    self.target_transforms = target_transforms
-                else:
-                    for col, _target_transform in zip(
-                        self.config.target, self.target_transforms
-                    ):
-                        data[col] = _target_transform.transform(
-                            data[col].values.reshape(-1, 1)
-                        )
+        if self.config.task != "ssl":
+            if all([col in data.columns for col in self.config.target]):
+                if self.do_target_transform:
+                    if stage == "fit":
+                        target_transforms = []
+                        for col in self.config.target:
+                            _target_transform = copy.deepcopy(
+                                self.target_transform_template
+                            )
+                            data[col] = _target_transform.fit_transform(
+                                data[col].values.reshape(-1, 1)
+                            )
+                            target_transforms.append(_target_transform)
+                        self.target_transforms = target_transforms
+                    else:
+                        for col, _target_transform in zip(
+                            self.config.target, self.target_transforms
+                        ):
+                            data[col] = _target_transform.transform(
+                                data[col].values.reshape(-1, 1)
+                            )
         return data, added_features
 
     def setup(self, stage: Optional[str] = None) -> None:
@@ -292,7 +307,7 @@ class TabularDatamodule(pl.LightningDataModule):
             if self.test is not None:
                 self.test, _ = self.preprocess_data(self.test, stage="inference")
             # Calculating the categorical dims and embedding dims etc and updating the config
-            self.update_config()
+            self.config = self.update_config(self.config)
             self.config._updated = True
             self._fitted = True
 

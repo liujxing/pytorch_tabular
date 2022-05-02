@@ -38,20 +38,19 @@ class BaseEncoder(object):
         if not self._mapping:
             raise ValueError("`fit` method must be called before `transform`.")
         assert all(c in X.columns for c in self.cols)
-
         X_encoded = X.copy(deep=True)
         for col, mapping in self._mapping.items():
-            X_encoded.loc[:, col] = (
-                X_encoded[col].fillna(NAN_CATEGORY).map(mapping["value"])
-            )
-
             if self.handle_unseen == "impute":
-                X_encoded[col].fillna(self._imputed, inplace=True)
+                X_encoded.loc[:, col] = (
+                    X_encoded[col].fillna(NAN_CATEGORY).map(mapping["value"])
+                )
+                # X_encoded[col].fillna(self._imputed, inplace=True)
             elif self.handle_unseen == "error":
                 if np.unique(X_encoded[col]).shape[0] > mapping.shape[0]:
                     raise ValueError(
                         "Unseen categories found in `{}` column.".format(col)
                     )
+                X_encoded.loc[:, col] = X_encoded[col].map(mapping["value"])
 
         return X_encoded
 
@@ -120,12 +119,22 @@ class OrdinalEncoder(BaseEncoder):
         """
         self._before_fit_check(X, y)
         for col in self.cols:
-            map = (
-                pd.Series(pd.unique(X[col].fillna(NAN_CATEGORY)), name=col)
-                .reset_index()
-                .rename(columns={"index": "value"})
-            )
-            map["value"] += 1
+            if self.handle_unseen == "error":
+                assert (
+                    pd.isna(X[col]).sum() == 0
+                ), f"Column {col} has NA values and `handle_unseen_categories` is set to `error`."
+                map = (
+                    pd.Series(pd.unique(X[col]), name=col)
+                    .reset_index()
+                    .rename(columns={"index": "value"})
+                )
+            else:
+                map = (
+                    pd.Series(pd.unique(X[col].fillna(NAN_CATEGORY)), name=col)
+                    .reset_index()
+                    .rename(columns={"index": "value"})
+                )
+                map["value"] += 1
             self._mapping[col] = map.set_index(col)
 
 
